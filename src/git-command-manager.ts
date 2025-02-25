@@ -5,6 +5,27 @@ import * as path from 'path'
 
 const tagsRefSpec = '+refs/tags/*:refs/tags/*'
 
+export type Commit = {
+  sha: string
+  tree: string
+  parents: string[]
+  signed: boolean
+  subject: string
+  body: string
+  changes: {
+    mode: string
+    dstSha: string
+    status: 'A' | 'M' | 'D'
+    path: string
+  }[]
+  unparsedChanges: string[]
+}
+
+export type ExecOpts = {
+  allowAllExitCodes?: boolean
+  encoding?: 'utf8' | 'base64'
+}
+
 export class GitCommandManager {
   private gitPath: string
   private workingDirectory: string
@@ -50,7 +71,7 @@ export class GitCommandManager {
       args.push(...options)
     }
 
-    return await this.exec(args, allowAllExitCodes)
+    return await this.exec(args, {allowAllExitCodes: allowAllExitCodes})
   }
 
   async commit(
@@ -66,20 +87,21 @@ export class GitCommandManager {
       args.push(...options)
     }
 
-    return await this.exec(args, allowAllExitCodes)
+    return await this.exec(args, {allowAllExitCodes: allowAllExitCodes})
   }
 
   async config(
     configKey: string,
     configValue: string,
-    globalConfig?: boolean
+    globalConfig?: boolean,
+    add?: boolean
   ): Promise<void> {
-    await this.exec([
-      'config',
-      globalConfig ? '--global' : '--local',
-      configKey,
-      configValue
-    ])
+    const args: string[] = ['config', globalConfig ? '--global' : '--local']
+    if (add) {
+      args.push('--add')
+    }
+    args.push(...[configKey, configValue])
+    await this.exec(args)
   }
 
   async configExists(
@@ -96,7 +118,7 @@ export class GitCommandManager {
         configKey,
         configValue
       ],
-      true
+      {allowAllExitCodes: true}
     )
     return output.exitCode === 0
   }
@@ -104,7 +126,8 @@ export class GitCommandManager {
   async fetch(
     refSpec: string[],
     remoteName?: string,
-    options?: string[]
+    options?: string[],
+    unshallow = false
   ): Promise<void> {
     const args = ['-c', 'protocol.version=2', 'fetch']
     if (!refSpec.some(x => x === tagsRefSpec)) {
@@ -112,7 +135,9 @@ export class GitCommandManager {
     }
 
     args.push('--progress', '--no-recurse-submodules')
+
     if (
+      unshallow &&
       utils.fileExistsSync(path.join(this.workingDirectory, '.git', 'shallow'))
     ) {
       args.push('--unshallow')
@@ -134,6 +159,50 @@ export class GitCommandManager {
     await this.exec(args)
   }
 
+  async getCommit(ref: string): Promise<Commit> {
+    const endOfBody = '###EOB###'
+    const output = await this.exec([
+      '-c',
+      'core.quotePath=false',
+      'show',
+      '--raw',
+      '--cc',
+      '--no-renames',
+      '--no-abbrev',
+      `--format=%H%n%T%n%P%n%G?%n%s%n%b%n${endOfBody}`,
+      ref
+    ])
+    const lines = output.stdout.split('\n')
+    const endOfBodyIndex = lines.lastIndexOf(endOfBody)
+    const detailLines = lines.slice(0, endOfBodyIndex)
+
+    const unparsedChanges: string[] = []
+    return <Commit>{
+      sha: detailLines[0],
+      tree: detailLines[1],
+      parents: detailLines[2].split(' '),
+      signed: detailLines[3] !== 'N',
+      subject: detailLines[4],
+      body: detailLines.slice(5, endOfBodyIndex).join('\n'),
+      changes: lines.slice(endOfBodyIndex + 2, -1).map(line => {
+        const change = line.match(
+          /^:(\d{6}) (\d{6}) \w{40} (\w{40}) ([AMD])\s+(.*)$/
+        )
+        if (change) {
+          return {
+            mode: change[4] === 'D' ? change[1] : change[2],
+            dstSha: change[3],
+            status: change[4],
+            path: change[5]
+          }
+        } else {
+          unparsedChanges.push(line)
+        }
+      }),
+      unparsedChanges: unparsedChanges
+    }
+  }
+
   async getConfigValue(configKey: string, configValue = '.'): Promise<string> {
     const output = await this.exec([
       'config',
@@ -145,6 +214,10 @@ export class GitCommandManager {
     return output.stdout.trim().split(`${configKey} `)[1]
   }
 
+  getGitDirectory(): Promise<string> {
+    return this.revParse('--git-dir')
+  }
+
   getWorkingDirectory(): string {
     return this.workingDirectory
   }
@@ -154,7 +227,7 @@ export class GitCommandManager {
     if (options) {
       args.push(...options)
     }
-    const output = await this.exec(args, true)
+    const output = await this.exec(args, {allowAllExitCodes: true})
     return output.exitCode === 1
   }
 
@@ -210,6 +283,29 @@ export class GitCommandManager {
     return output.stdout.trim()
   }
 
+  async showFileAtRefBase64(ref: string, path: string): Promise<string> {
+    const args = ['show', `${ref}:${path}`]
+    const output = await this.exec(args, {encoding: 'base64'})
+    return output.stdout.trim()
+  }
+
+  async stashPush(options?: string[]): Promise<boolean> {
+    const args = ['stash', 'push']
+    if (options) {
+      args.push(...options)
+    }
+    const output = await this.exec(args)
+    return output.stdout.trim() !== 'No local changes to save'
+  }
+
+  async stashPop(options?: string[]): Promise<void> {
+    const args = ['stash', 'pop']
+    if (options) {
+      args.push(...options)
+    }
+    await this.exec(args)
+  }
+
   async status(options?: string[]): Promise<string> {
     const args = ['status']
     if (options) {
@@ -241,7 +337,7 @@ export class GitCommandManager {
         configKey,
         configValue
       ],
-      true
+      {allowAllExitCodes: true}
     )
     return output.exitCode === 0
   }
@@ -249,7 +345,7 @@ export class GitCommandManager {
   async tryGetRemoteUrl(): Promise<string> {
     const output = await this.exec(
       ['config', '--local', '--get', 'remote.origin.url'],
-      true
+      {allowAllExitCodes: true}
     )
 
     if (output.exitCode !== 0) {
@@ -264,7 +360,10 @@ export class GitCommandManager {
     return stdout
   }
 
-  async exec(args: string[], allowAllExitCodes = false): Promise<GitOutput> {
+  async exec(
+    args: string[],
+    {encoding = 'utf8', allowAllExitCodes = false}: ExecOpts = {}
+  ): Promise<GitOutput> {
     const result = new GitOutput()
 
     const env = {}
@@ -272,8 +371,10 @@ export class GitCommandManager {
       env[key] = process.env[key]
     }
 
-    const stdout: string[] = []
-    const stderr: string[] = []
+    const stdout: Buffer[] = []
+    let stdoutLength = 0
+    const stderr: Buffer[] = []
+    let stderrLength = 0
 
     const options = {
       cwd: this.workingDirectory,
@@ -281,17 +382,19 @@ export class GitCommandManager {
       ignoreReturnCode: allowAllExitCodes,
       listeners: {
         stdout: (data: Buffer) => {
-          stdout.push(data.toString())
+          stdout.push(data)
+          stdoutLength += data.length
         },
         stderr: (data: Buffer) => {
-          stderr.push(data.toString())
+          stderr.push(data)
+          stderrLength += data.length
         }
       }
     }
 
     result.exitCode = await exec.exec(`"${this.gitPath}"`, args, options)
-    result.stdout = stdout.join('')
-    result.stderr = stderr.join('')
+    result.stdout = Buffer.concat(stdout, stdoutLength).toString(encoding)
+    result.stderr = Buffer.concat(stderr, stderrLength).toString(encoding)
     return result
   }
 }
